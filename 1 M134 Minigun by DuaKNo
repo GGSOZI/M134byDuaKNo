@@ -1,0 +1,1156 @@
+local Players         = game:GetService("Players")
+local RunService      = game:GetService("RunService")
+local Debris          = game:GetService("Debris")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local TweenService    = game:GetService("TweenService")
+local ContentProvider = game:GetService("ContentProvider")
+local LocalPlayer     = Players.LocalPlayer
+
+local SCALE        = 0.65
+local ICON_ID      = nil
+local GRIP_POS     = Vector3.new(0, -3, 0)
+local GRIP_ROT_DEG = Vector3.new(-45, 30, -15)
+
+local REF_RIGHT = {pitch = 65, swing = -30}
+
+local STRAIGHT_GUN = true
+local STRAIGHT_ROT = CFrame.Angles(math.rad(-90), 0, 0)
+local MAX_STRETCH  = 1.2
+
+local SOUND_IDS = {
+	fire     = 8509627368,
+	windUp   = 8509641476,
+	windLoop = 8509658502,
+	shutdown = 92739874788200,
+}
+local VOLUME = {fire = 1, windUp = 1, windLoop = 0.8, shutdown = 1}
+local WINDUP_TIME = 1.2
+local SPIN_HOLD   = 1.5
+local CHARGE_MAX  = 1.5
+local CHARGE_TIME = 1.0
+
+local DOUBLE_CLICK_TIME = 0.6
+local FIRE_RATE         = 20
+local BULLET_SPEED      = 400
+local BULLET_LIFETIME   = 3
+local BULLET_SPREAD_DEG = 0.4
+local BULLET_COLOR      = Color3.fromRGB(255, 200, 80)
+local MUZZLE_OFFSET     = Vector3.new(0, 4, 0) * SCALE
+
+local SPARK_TEXTURE  = "rbxasset://textures/particles/sparkles_main.dds"
+local SMOKE_TEXTURE  = "rbxasset://textures/particles/smoke_main.dds"
+local IMPACT_MIN_GAP = 0
+local HOLE_TEXTURE   = ""
+local MAX_HOLES      = 40
+local HOLE_LIFETIME  = 10
+
+local PROFILES = {
+	R6 = {
+		right    = Vector3.new(0.3, -3.8, 0.8),
+		left     = Vector3.new(-0.7, -1.4, 0.9),
+		leftTilt = Vector3.new(10, -80, 40),
+		gun      = Vector3.new(-0.2, -0.9, -0.2),
+		tilt     = Vector3.new(0, 0, 0),
+	},
+	R15 = {
+		right    = Vector3.new(0.1, -3.3, 1.3),
+		left     = Vector3.new(-0.1, -1.6, 0.9),
+		leftTilt = Vector3.new(75, -110, 85),
+		gun      = Vector3.new(-0.2, -1.2, 0.2),
+		tilt     = Vector3.new(0, 0, 0),
+	},
+}
+
+local TOOL_NAME = "M134 Minigun"
+local ARM_DEBUG = false
+local DEBUG     = false
+local RANGE     = 2000
+
+local BEAM_COLOR     = Color3.fromRGB(255, 235, 0)
+local BEAM_THICKNESS = 0.08
+local BEAM_FADE_TIME = 0.15
+local FLING_SPEED    = 600
+local FLING_TIME     = 2
+local FLING_PLAYERS  = false
+local FIRE_SLOW      = 0.75
+
+local function rigOf(char)
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum and hum.RigType == Enum.HumanoidRigType.R15 then return "R15" end
+	return "R6"
+end
+
+local function armPose(a)
+	return CFrame.Angles(math.rad(a.pitch), 0, math.rad(a.swing))
+end
+
+local function rotatedAbout(c0, rot)
+	local p = c0.Position
+	return CFrame.new(p) * rot * CFrame.new(-p) * c0
+end
+
+local function findMotor(char, names)
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("Motor6D") and names[d.Name] then
+			return d
+		end
+	end
+end
+
+local function refGrip()
+	return CFrame.new(GRIP_POS * SCALE)
+		* CFrame.Angles(math.rad(90), 0, 0)
+		* CFrame.Angles(math.rad(GRIP_ROT_DEG.X), math.rad(GRIP_ROT_DEG.Y), math.rad(GRIP_ROT_DEG.Z))
+end
+
+local function newEmitter(parent, props)
+	local e = Instance.new("ParticleEmitter")
+	e.Rate = 0
+	e.Enabled = false
+	for k, v in pairs(props) do
+		e[k] = v
+	end
+	e.Parent = parent
+	return e
+end
+
+local function fade(a, b)
+	return NumberSequence.new({NumberSequenceKeypoint.new(0, a), NumberSequenceKeypoint.new(1, b)})
+end
+
+local function buildTool()
+	local Tool = Instance.new("Tool")
+	Tool.Name = TOOL_NAME
+	Tool.ToolTip = TOOL_NAME
+	Tool.TextureId = ICON_ID and ("rbxthumb://type=Asset&id=%d&w=150&h=150"):format(ICON_ID) or ""
+	Tool.CanBeDropped = false
+	Tool.RequiresHandle = true
+
+	local Handle = Instance.new("Part")
+	Handle.Name = "Handle"
+	Handle.Size = Vector3.new(1, 8, 2) * SCALE
+	Handle.CanCollide = false
+	Handle.Massless = true
+	Handle.TopSurface = Enum.SurfaceType.Smooth
+	Handle.BottomSurface = Enum.SurfaceType.Smooth
+	Handle.Parent = Tool
+
+	local Mesh = Instance.new("SpecialMesh")
+	Mesh.MeshType = Enum.MeshType.FileMesh
+	Mesh.MeshId = "rbxassetid://71947307"
+	Mesh.TextureId = "rbxassetid://71947249"
+	Mesh.Scale = Vector3.new(2, 2, 2) * SCALE
+	Mesh.Parent = Handle
+
+	Tool.Grip = refGrip()
+	return Tool
+end
+
+do
+	local old = workspace:FindFirstChild("M134Bullets")
+	if old then old:Destroy() end
+end
+local bulletFolder = Instance.new("Folder")
+bulletFolder.Name = "M134Bullets"
+bulletFolder.Parent = workspace
+
+local bullets = {}
+local holes = {}
+local lastImpact = 0
+
+local METAL = {
+	[Enum.Material.Metal] = true, [Enum.Material.DiamondPlate] = true,
+	[Enum.Material.CorrodedMetal] = true, [Enum.Material.Foil] = true,
+}
+local SOFT = {
+	[Enum.Material.Wood] = true, [Enum.Material.WoodPlanks] = true,
+	[Enum.Material.Grass] = true, [Enum.Material.Sand] = true,
+	[Enum.Material.Ground] = true, [Enum.Material.Mud] = true,
+	[Enum.Material.Snow] = true, [Enum.Material.Slate] = true,
+}
+
+local function isCharacterPart(inst)
+	local m = inst:FindFirstAncestorOfClass("Model")
+	return m and m:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+local function makeHole(result)
+	local hit = result.Instance
+	if not hit or hit.Transparency > 0.9 then return end
+
+	local hole = Instance.new("Part")
+	hole.Name = "BulletHole"
+	hole.Anchored = false
+	hole.CanCollide = false
+	hole.CanQuery = false
+	hole.CanTouch = false
+	hole.Massless = true
+	hole.CastShadow = false
+	hole.Material = Enum.Material.SmoothPlastic
+	hole.TopSurface = Enum.SurfaceType.Smooth
+	hole.BottomSurface = Enum.SurfaceType.Smooth
+
+	local normal = result.Normal
+	local pos = result.Position + normal * 0.012
+	local base = CFrame.lookAt(pos, pos + normal)
+
+	if HOLE_TEXTURE ~= "" then
+		hole.Size = Vector3.new(0.5, 0.5, 0.02)
+		hole.Transparency = 1
+		hole.CFrame = base * CFrame.Angles(0, 0, math.rad(math.random(0, 359)))
+		local d = Instance.new("Decal")
+		d.Texture = HOLE_TEXTURE
+		d.Face = Enum.NormalId.Front
+		d.Parent = hole
+	else
+		local s = 0.22 + math.random() * 0.12
+		hole.Shape = Enum.PartType.Cylinder
+		hole.Size = Vector3.new(0.015, s, s)
+		hole.Color = Color3.fromRGB(12, 12, 12)
+		hole.CFrame = base * CFrame.Angles(0, math.rad(90), 0)
+
+		local ring = hole:Clone()
+		ring.Name = "Scorch"
+		ring.Size = Vector3.new(0.01, s * 2.1, s * 2.1)
+		ring.Color = hit.Color:Lerp(Color3.new(0, 0, 0), 0.65)
+		ring.Transparency = 0.45
+		ring.CFrame = hole.CFrame * CFrame.new(-0.002, 0, 0)
+		ring.Parent = bulletFolder
+		local rw = Instance.new("WeldConstraint")
+		rw.Part0, rw.Part1 = ring, hit
+		rw.Parent = ring
+		Debris:AddItem(ring, HOLE_LIFETIME + 1)
+		TweenService:Create(ring, TweenInfo.new(2, Enum.EasingStyle.Linear, Enum.EasingDirection.In, 0, false, HOLE_LIFETIME - 2), {Transparency = 1}):Play()
+	end
+
+	hole.Parent = bulletFolder
+	local w = Instance.new("WeldConstraint")
+	w.Part0, w.Part1 = hole, hit
+	w.Parent = hole
+
+	table.insert(holes, hole)
+	if #holes > MAX_HOLES then
+		local o = table.remove(holes, 1)
+		if o then o:Destroy() end
+	end
+	Debris:AddItem(hole, HOLE_LIFETIME + 1)
+	if hole.Transparency < 1 then
+		TweenService:Create(hole, TweenInfo.new(2, Enum.EasingStyle.Linear, Enum.EasingDirection.In, 0, false, HOLE_LIFETIME - 2), {Transparency = 1}):Play()
+	end
+end
+
+local fxList = {}
+
+local function rand(a, b) return a + math.random() * (b - a) end
+
+local function newFx(size, color, shape, material)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Size = size
+	p.Color = color
+	p.Material = material or Enum.Material.Neon
+	if shape then p.Shape = shape end
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	return p
+end
+
+local function throwPiece(part, pos, vel, life, gravity, stretch, spin)
+	part.CFrame = CFrame.new(pos)
+	part.Parent = bulletFolder
+	table.insert(fxList, {
+		part = part, pos = pos, vel = vel, life = life, age = 0, g = gravity,
+		stretch = stretch, spin = spin or Vector3.zero, rot = CFrame.new(), size = part.Size,
+	})
+end
+
+RunService.Heartbeat:Connect(function(dt)
+	for i = #fxList, 1, -1 do
+		local f = fxList[i]
+		f.age += dt
+		if f.age >= f.life or not f.part.Parent then
+			f.part:Destroy()
+			table.remove(fxList, i)
+		else
+			f.vel += Vector3.new(0, -f.g, 0) * dt
+			f.vel *= (1 - 1.2 * dt)
+			f.pos += f.vel * dt
+			local t = f.age / f.life
+			if f.stretch then
+				local len = math.clamp(f.vel.Magnitude * 0.035, 0.15, 1.6)
+				f.part.Size = Vector3.new(f.size.X, f.size.Y, len)
+				if f.vel.Magnitude > 0.1 then
+					f.part.CFrame = CFrame.lookAt(f.pos, f.pos + f.vel)
+				end
+			else
+				f.rot = f.rot * CFrame.Angles(f.spin.X * dt, f.spin.Y * dt, f.spin.Z * dt)
+				f.part.CFrame = CFrame.new(f.pos) * f.rot
+			end
+			f.part.Transparency = t * t
+		end
+	end
+end)
+
+local function muzzleFlash(origin, dir)
+	local f = newFx(Vector3.new(0.8, 0.8, 0.8), Color3.fromRGB(255, 235, 170), Enum.PartType.Ball)
+	f.CFrame = CFrame.new(origin + dir * 0.3)
+	f.Parent = bulletFolder
+	TweenService:Create(f, TweenInfo.new(0.05, Enum.EasingStyle.Quad), {Size = Vector3.new(3, 3, 3), Transparency = 1}):Play()
+	Debris:AddItem(f, 0.12)
+end
+
+local function impactEffect(result)
+	local now = os.clock()
+	if now - lastImpact < IMPACT_MIN_GAP then return end
+	lastImpact = now
+
+	local pos, normal = result.Position, result.Normal
+	local hit = result.Instance
+	local mat = result.Material
+	local surfColor = hit and hit.Color or Color3.fromRGB(150, 150, 150)
+	local onChar = hit and isCharacterPart(hit)
+	local metal = METAL[mat]
+	local soft = SOFT[mat]
+
+	local surf = CFrame.lookAt(pos, pos + normal)
+
+	local core = newFx(Vector3.new(0.3, 0.3, 0.3), Color3.fromRGB(255, 250, 220), Enum.PartType.Ball)
+	core.CFrame = CFrame.new(pos + normal * 0.1)
+	core.Parent = bulletFolder
+	TweenService:Create(core, TweenInfo.new(0.09, Enum.EasingStyle.Quad), {Size = Vector3.new(1.3, 1.3, 1.3), Transparency = 1}):Play()
+	Debris:AddItem(core, 0.15)
+
+	local glow = newFx(Vector3.new(0.5, 0.5, 0.5), BULLET_COLOR, Enum.PartType.Ball)
+	glow.Transparency = 0.35
+	glow.CFrame = CFrame.new(pos + normal * 0.15)
+	glow.Parent = bulletFolder
+	TweenService:Create(glow, TweenInfo.new(0.16, Enum.EasingStyle.Quad), {Size = Vector3.new(2.4, 2.4, 2.4), Transparency = 1}):Play()
+	Debris:AddItem(glow, 0.2)
+
+	local ring = newFx(Vector3.new(0.04, 0.4, 0.4), Color3.fromRGB(255, 190, 90), Enum.PartType.Cylinder)
+	ring.Transparency = 0.2
+	ring.CFrame = surf * CFrame.new(0, 0, -0.03) * CFrame.Angles(0, math.rad(90), 0)
+	ring.Parent = bulletFolder
+	TweenService:Create(ring, TweenInfo.new(0.22, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = Vector3.new(0.04, 4, 4), Transparency = 1}):Play()
+	Debris:AddItem(ring, 0.3)
+
+	local nSparks = onChar and 5 or (metal and 12 or 8)
+	for _ = 1, nSparks do
+		local s = newFx(Vector3.new(0.07, 0.07, 0.4), Color3.fromRGB(255, math.random(170, 235), math.random(60, 140)))
+		local dir = (normal + Vector3.new(rand(-1, 1), rand(-0.6, 1), rand(-1, 1)) * 0.9).Unit
+		throwPiece(s, pos + normal * 0.1, dir * rand(18, metal and 46 or 32), rand(0.3, metal and 0.7 or 0.5), 70, true)
+	end
+
+	if not onChar then
+		for _ = 1, (soft and 6 or 4) do
+			local sz = rand(0.08, soft and 0.22 or 0.15)
+			local c = newFx(Vector3.new(sz, sz, sz * rand(0.6, 1.2)), surfColor:Lerp(Color3.new(0, 0, 0), rand(0, 0.35)), nil, Enum.Material.SmoothPlastic)
+			local dir = (normal + Vector3.new(rand(-1, 1), rand(-0.3, 1), rand(-1, 1)) * 0.8).Unit
+			throwPiece(c, pos + normal * 0.1, dir * rand(8, 22), rand(0.5, 1), 55, false,
+				Vector3.new(rand(-12, 12), rand(-12, 12), rand(-12, 12)))
+		end
+
+		for _ = 1, 2 do
+			local puff = newFx(Vector3.new(0.3, 0.3, 0.3), surfColor:Lerp(Color3.fromRGB(180, 180, 180), 0.6), Enum.PartType.Ball, Enum.Material.SmoothPlastic)
+			puff.Transparency = 0.55
+			puff.CFrame = CFrame.new(pos + normal * 0.2 + Vector3.new(rand(-0.3, 0.3), rand(-0.3, 0.3), rand(-0.3, 0.3)))
+			puff.Parent = bulletFolder
+			local life = rand(0.6, 1)
+			local sz = rand(1.4, soft and 3 or 2.2)
+			TweenService:Create(puff, TweenInfo.new(life, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+				Size = Vector3.new(sz, sz, sz),
+				Transparency = 1,
+				Position = puff.Position + normal * rand(0.5, 1.2) + Vector3.new(0, rand(0.6, 1.4), 0),
+			}):Play()
+			Debris:AddItem(puff, life + 0.1)
+		end
+	end
+
+	local pl = Instance.new("PointLight")
+	pl.Color = Color3.fromRGB(255, 190, 90)
+	pl.Range = 8
+	pl.Brightness = 3
+	pl.Parent = core
+	TweenService:Create(pl, TweenInfo.new(0.1), {Brightness = 0}):Play()
+
+	if hit and not onChar then
+		local ok, err = pcall(makeHole, result)
+		if not ok then warn("[M134] bullet hole failed: " .. tostring(err)) end
+	end
+end
+
+local function spawnBullet(origin, dir, params)
+	local part = Instance.new("Part")
+	part.Name = "Bullet"
+	part.Size = Vector3.new(0.35, 0.35, 4)
+	part.Material = Enum.Material.Neon
+	part.Color = BULLET_COLOR
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.CFrame = CFrame.lookAt(origin, origin + dir)
+
+	local a0 = Instance.new("Attachment")
+	a0.Position = Vector3.new(0, 0.17, 2)
+	a0.Parent = part
+	local a1 = Instance.new("Attachment")
+	a1.Position = Vector3.new(0, -0.17, 2)
+	a1.Parent = part
+	local trail = Instance.new("Trail")
+	trail.Attachment0, trail.Attachment1 = a0, a1
+	trail.Lifetime = 0.25
+	trail.LightEmission = 1
+	trail.Color = ColorSequence.new(Color3.fromRGB(255, 240, 180), BULLET_COLOR)
+	trail.Transparency = fade(0.2, 1)
+	trail.WidthScale = NumberSequence.new(1, 0)
+	trail.Parent = part
+
+	part.Parent = bulletFolder
+	table.insert(bullets, {part = part, pos = origin, dir = dir, life = BULLET_LIFETIME, params = params})
+end
+
+RunService.Heartbeat:Connect(function(dt)
+	for i = #bullets, 1, -1 do
+		local b = bullets[i]
+		b.life -= dt
+		local step = b.dir * (BULLET_SPEED * dt)
+		local result = workspace:Raycast(b.pos, step, b.params)
+		if result then
+			local ok, err = pcall(impactEffect, result)
+			if not ok then warn("[M134] impact effect error: " .. tostring(err)) end
+			b.part:Destroy()
+			table.remove(bullets, i)
+		elseif b.life <= 0 then
+			b.part:Destroy()
+			table.remove(bullets, i)
+		else
+			b.pos += step
+			b.part.CFrame = CFrame.lookAt(b.pos, b.pos + b.dir)
+		end
+	end
+end)
+
+local function boostRadius()
+	pcall(function() sethiddenproperty(LocalPlayer, "SimulationRadius", 5000) end)
+	pcall(function() setsimulationradius(5000, 5000) end)
+end
+boostRadius()
+task.spawn(function()
+	while true do
+		task.wait(2)
+		boostRadius()
+	end
+end)
+
+local flingUntil = {}
+
+local function findNpc(inst)
+	local m = inst
+	while m and m ~= workspace do
+		if m:IsA("Model") and m:FindFirstChildOfClass("Humanoid") then
+			if Players:GetPlayerFromCharacter(m) and not FLING_PLAYERS then return nil end
+			return m
+		end
+		m = m.Parent
+	end
+	return nil
+end
+
+local function flingNpc(model, dir)
+	local vel = dir.Unit * FLING_SPEED
+
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if hum then
+		pcall(function()
+			hum.PlatformStand = true
+			hum:ChangeState(Enum.HumanoidStateType.Physics)
+		end)
+	end
+
+	local already = flingUntil[model] ~= nil
+	flingUntil[model] = os.clock() + FLING_TIME
+	if already then return end
+
+	task.spawn(function()
+		while model.Parent and os.clock() < flingUntil[model] do
+			for _, part in ipairs(model:GetDescendants()) do
+				if part:IsA("BasePart") and not part.Anchored then
+					part.AssemblyLinearVelocity = vel
+					part.AssemblyAngularVelocity = Vector3.new(rand(-20, 20), rand(-20, 20), rand(-20, 20))
+				end
+			end
+			RunService.Heartbeat:Wait()
+		end
+		flingUntil[model] = nil
+		if hum and hum.Parent then pcall(function() hum.PlatformStand = false end) end
+	end)
+end
+
+local function flingPart(part, dir)
+	if part.Anchored then return end
+	local root = part.AssemblyRootPart or part
+	if root.Anchored then return end
+	local vel = dir.Unit * FLING_SPEED
+
+	local already = flingUntil[root] ~= nil
+	flingUntil[root] = os.clock() + FLING_TIME
+	if already then return end
+
+	task.spawn(function()
+		while root.Parent and os.clock() < flingUntil[root] do
+			local list = {root}
+			local ok, connected = pcall(function() return root:GetConnectedParts(true) end)
+			if ok then list = connected end
+			for _, p in ipairs(list) do
+				if not p.Anchored then
+					p.AssemblyLinearVelocity = vel
+					p.AssemblyAngularVelocity = Vector3.new(rand(-20, 20), rand(-20, 20), rand(-20, 20))
+				end
+			end
+			RunService.Heartbeat:Wait()
+		end
+		flingUntil[root] = nil
+	end)
+end
+
+local stats = {shots = 0, hits = 0, err = "", arm = "", resets = 0}
+local dbgLabel
+local lastDbg = 0
+local function debugUpdate(force)
+	if not (DEBUG or ARM_DEBUG) then return end
+	local now = os.clock()
+	if not force and now - lastDbg < 0.2 then return end
+	lastDbg = now
+	if not (dbgLabel and dbgLabel.Parent) then
+		local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		if not pg then return end
+		local g = Instance.new("ScreenGui")
+		g.Name = "M134Debug"
+		g.ResetOnSpawn = false
+		g.IgnoreGuiInset = true
+		g.Parent = pg
+		dbgLabel = Instance.new("TextLabel")
+		dbgLabel.BackgroundTransparency = 0.5
+		dbgLabel.BackgroundColor3 = Color3.new(0, 0, 0)
+		dbgLabel.TextColor3 = Color3.new(1, 1, 1)
+		dbgLabel.TextXAlignment = Enum.TextXAlignment.Left
+		dbgLabel.Font = Enum.Font.Code
+		dbgLabel.TextSize = 14
+		dbgLabel.Position = UDim2.fromOffset(10, 40)
+		dbgLabel.Size = UDim2.fromOffset(330, 70)
+		dbgLabel.TextWrapped = true
+		dbgLabel.Parent = g
+	end
+	dbgLabel.Text = ("M134  shots %d  hits %d\narms: %s  resets %d%s"):format(stats.shots, stats.hits, stats.arm, stats.resets, stats.err ~= "" and ("\nERR: " .. stats.err) or "")
+end
+
+local function fireShot(origin, dir, params)
+	stats.shots += 1
+	local res = workspace:Raycast(origin, dir * RANGE, params)
+	local endPos = res and res.Position or (origin + dir * RANGE)
+	local dist = (endPos - origin).Magnitude
+
+	local len = math.min(dist, 2040)
+	local line = newFx(Vector3.new(BEAM_THICKNESS, BEAM_THICKNESS, len), BEAM_COLOR)
+	line.CFrame = CFrame.lookAt(origin, endPos) * CFrame.new(0, 0, -len / 2)
+	line.Parent = bulletFolder
+	TweenService:Create(line, TweenInfo.new(BEAM_FADE_TIME, Enum.EasingStyle.Quad), {Transparency = 1}):Play()
+	Debris:AddItem(line, BEAM_FADE_TIME + 0.05)
+
+	for _ = 1, 3 do
+		local sp = newFx(Vector3.new(0.1, 0.1, 0.5), Color3.fromRGB(255, math.random(170, 230), 80))
+		local d = (dir + Vector3.new(rand(-0.35, 0.35), rand(-0.35, 0.35), rand(-0.35, 0.35))).Unit
+		throwPiece(sp, origin, d * rand(20, 45), rand(0.15, 0.3), 30, true)
+	end
+
+	if res then
+		stats.hits += 1
+		local ok, err = pcall(impactEffect, res)
+		if not ok then stats.err = tostring(err); debugUpdate(true) end
+		local npc = findNpc(res.Instance)
+		if npc then
+			local ok2, err2 = pcall(flingNpc, npc, dir)
+			if not ok2 then stats.err = tostring(err2); debugUpdate(true) end
+		else
+			local m = res.Instance:FindFirstAncestorOfClass("Model")
+			local isPlayerChar = m and Players:GetPlayerFromCharacter(m) ~= nil
+			if not isPlayerChar and res.Instance:IsA("BasePart") and not res.Instance.Anchored then
+				local ok3, err3 = pcall(flingPart, res.Instance, dir)
+				if not ok3 then stats.err = tostring(err3); debugUpdate(true) end
+			end
+		end
+	end
+	debugUpdate()
+end
+
+local function makeSounds(handle)
+	local s = {}
+	for name, id in pairs(SOUND_IDS) do
+		local snd = Instance.new("Sound")
+		snd.Name = name
+		snd.SoundId = "rbxassetid://" .. id
+		snd.Volume = VOLUME[name]
+		snd.Looped = (name == "fire" or name == "windLoop")
+		snd.RollOffMaxDistance = 150
+		snd.Parent = handle
+		s[name] = snd
+	end
+	return s
+end
+
+local function checkSounds(sounds)
+	task.spawn(function()
+		local list = {}
+		for _, s in pairs(sounds) do table.insert(list, s) end
+		pcall(function() ContentProvider:PreloadAsync(list) end)
+		for name, s in pairs(sounds) do
+			if s.TimeLength == 0 then
+				warn(("[M134] '%s' (%s) did not load. The audio is probably private or not usable in this game."):format(name, s.SoundId))
+			end
+		end
+	end)
+end
+
+local function setupWeapon(tool)
+	local handle = tool:WaitForChild("Handle")
+	local sounds = makeSounds(handle)
+	checkSounds(sounds)
+
+	local att = Instance.new("Attachment")
+	att.Name = "Muzzle"
+	att.Position = MUZZLE_OFFSET
+	att.Parent = handle
+
+	local light = Instance.new("PointLight")
+	light.Color = BULLET_COLOR
+	light.Range = 12
+	light.Brightness = 4
+	light.Enabled = false
+	light.Parent = att
+
+	local muzzleSmoke = newEmitter(att, {
+		Texture = SMOKE_TEXTURE,
+		Color = ColorSequence.new(Color3.fromRGB(190, 190, 190)),
+		Size = fade(0.3, 1.8),
+		Transparency = fade(0.55, 1),
+		Lifetime = NumberRange.new(0.7, 1.3),
+		Speed = NumberRange.new(3, 7),
+		SpreadAngle = Vector2.new(12, 12),
+		Acceleration = Vector3.new(0, 2.5, 0),
+		Rotation = NumberRange.new(0, 360),
+		RotSpeed = NumberRange.new(-40, 40),
+		Rate = 35,
+	})
+
+	local firing = false
+	local soundToken = 0
+	local charging, chargeId = false, 0
+	local savedSpeed, slowHum
+
+	local function restoreSpeed()
+		if slowHum and slowHum.Parent and savedSpeed then
+			slowHum.WalkSpeed = savedSpeed
+		end
+		savedSpeed, slowHum = nil, nil
+	end
+	local held = {tool = false, btn = false}
+
+	local function aimDirection(origin, params)
+		local cam = workspace.CurrentCamera
+		if not cam then return handle.CFrame.UpVector end
+		local vp = cam.ViewportSize
+		local pt
+		if UserInputService.TouchEnabled and not UserInputService.MouseEnabled then
+			pt = Vector2.new(vp.X / 2, vp.Y / 2)
+		else
+			pt = UserInputService:GetMouseLocation()
+		end
+		local ray = cam:ViewportPointToRay(pt.X, pt.Y)
+		local res = workspace:Raycast(ray.Origin, ray.Direction * 1500, params)
+		local target = res and res.Position or (ray.Origin + ray.Direction * 1500)
+		local d = target - origin
+		if d.Magnitude < 1 then return ray.Direction end
+		local dir = d.Unit
+		if dir:Dot(ray.Direction) < 0.2 then return ray.Direction end
+		return dir
+	end
+
+	local function shoot(params)
+		local cf = handle.CFrame
+		local origin = cf:PointToWorldSpace(MUZZLE_OFFSET)
+		local s = math.rad(BULLET_SPREAD_DEG)
+		local aim = CFrame.lookAt(Vector3.zero, aimDirection(origin, params))
+			* CFrame.Angles((math.random() - 0.5) * 2 * s, (math.random() - 0.5) * 2 * s, 0)
+		fireShot(origin, aim.LookVector, params)
+		muzzleFlash(origin, aim.LookVector)
+		light.Enabled = true
+		task.delay(0.04, function() light.Enabled = false end)
+	end
+
+	local function stopFiring()
+		if not firing then return end
+		firing = false
+		restoreSpeed()
+		muzzleSmoke.Enabled = false
+		sounds.fire:Stop()
+		sounds.windUp:Stop()
+		soundToken += 1
+		sounds.windLoop:Stop()
+		sounds.shutdown:Play()
+	end
+
+	local function startFiring()
+		if firing then return end
+		local char = tool.Parent
+		if not (char and char:IsA("Model")) then return end
+		firing = true
+
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum and not slowHum then
+			savedSpeed = hum.WalkSpeed
+			slowHum = hum
+			hum.WalkSpeed = savedSpeed * (1 - FIRE_SLOW)
+		end
+
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = {char, bulletFolder}
+
+		soundToken += 1
+		sounds.windLoop:Stop()
+		sounds.shutdown:Stop()
+		sounds.windUp:Stop()
+		sounds.fire:Play()
+		muzzleSmoke.Enabled = true
+		task.spawn(function()
+			while firing and tool.Parent == char do
+				local ok, err = pcall(shoot, params)
+				if not ok then stats.err = tostring(err); debugUpdate(true) end
+				task.wait(1 / FIRE_RATE)
+			end
+		end)
+	end
+
+	local function beginCharge()
+		if firing or charging then return end
+		charging = true
+		chargeId += 1
+		local my = chargeId
+		soundToken += 1
+		sounds.windLoop:Stop()
+		sounds.shutdown:Stop()
+		sounds.windUp:Play()
+		local dur = sounds.windUp.TimeLength
+		if dur <= 0 then dur = CHARGE_TIME end
+		dur = math.min(dur, CHARGE_MAX)
+		task.delay(dur, function()
+			if chargeId ~= my or not charging then return end
+			charging = false
+			if (held.tool or held.btn) and tool.Parent and tool.Parent:IsA("Model") then
+				startFiring()
+			end
+		end)
+	end
+
+	local function refresh()
+		if held.tool or held.btn then
+			if tool.Parent and tool.Parent:IsA("Model") then beginCharge() end
+		else
+			if charging then
+				charging = false
+				chargeId += 1
+				sounds.windUp:Stop()
+			end
+			stopFiring()
+		end
+	end
+
+	local rmbConn1, rmbConn2
+	local function bindMouse()
+		if rmbConn1 then return end
+		rmbConn1 = UserInputService.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton2 then
+				held.tool = true
+				refresh()
+			end
+		end)
+		rmbConn2 = UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton2 then
+				held.tool = false
+				refresh()
+			end
+		end)
+	end
+	local function unbindMouse()
+		if rmbConn1 then rmbConn1:Disconnect(); rmbConn1 = nil end
+		if rmbConn2 then rmbConn2:Disconnect(); rmbConn2 = nil end
+		held.tool = false
+	end
+
+	local ACTION = "M134Fire"
+	local bound = false
+	local function showButton()
+		if bound or not UserInputService.TouchEnabled then return end
+		bound = true
+		ContextActionService:BindAction(ACTION, function(_, state)
+			if state == Enum.UserInputState.Begin then
+				held.btn = true
+				refresh()
+			elseif state == Enum.UserInputState.End or state == Enum.UserInputState.Cancel then
+				held.btn = false
+				refresh()
+			end
+			return Enum.ContextActionResult.Sink
+		end, true, Enum.KeyCode.ButtonR2)
+		ContextActionService:SetTitle(ACTION, "FIRE")
+		ContextActionService:SetPosition(ACTION, UDim2.new(1, -110, 1, -170))
+	end
+	local function hideButton()
+		held.btn = false
+		if bound then
+			bound = false
+			ContextActionService:UnbindAction(ACTION)
+		end
+	end
+
+	tool.Equipped:Connect(function() showButton(); bindMouse() end)
+	tool.Unequipped:Connect(function() hideButton(); unbindMouse(); refresh() end)
+	if tool.Parent and tool.Parent:IsA("Model") then showButton(); bindMouse() end
+
+	return function()
+		held.tool, held.btn = false, false
+		firing, charging = false, false
+		chargeId += 1
+		restoreSpeed()
+		for _, snd in pairs(sounds) do snd:Stop() end
+		light.Enabled = false
+		muzzleSmoke.Enabled = false
+		hideButton()
+		unbindMouse()
+	end
+end
+
+local active = {}
+
+local maintainClean
+
+local function release()
+	if maintainClean then maintainClean(); maintainClean = nil end
+	for _, a in ipairs(active) do
+		if a.weld then a.weld:Destroy() end
+		if a.motor and a.motor.Parent then a.motor.Part1 = a.part1 end
+	end
+	table.clear(active)
+end
+
+local function takeOver(motor)
+	if not (motor and motor.Part0 and motor.Part1) then return nil end
+	local w = Instance.new("Weld")
+	w.Name = "MinigunPose"
+	w.Part0 = motor.Part0
+	w.Part1 = motor.Part1
+	w.C0 = motor.C0
+	w.C1 = motor.C1
+	w.Parent = motor.Part0
+	table.insert(active, {motor = motor, part1 = motor.Part1, weld = w})
+	motor.Part1 = nil
+	return w
+end
+
+local function getRig(char, side)
+	local shoulder = findMotor(char, {[side .. " Shoulder"] = true, [side .. "Shoulder"] = true})
+	if not shoulder then return nil end
+	local chain = {}
+	local elbow = findMotor(char, {[side .. "Elbow"] = true})
+	local wrist = findMotor(char, {[side .. "Wrist"] = true})
+	if elbow then table.insert(chain, elbow) end
+	if wrist then table.insert(chain, wrist) end
+	local rel = CFrame.new()
+	for _, m in ipairs(chain) do
+		rel = rel * m.C0 * m.C1:Inverse()
+	end
+	return {shoulder = shoulder, chain = chain, rel = rel}
+end
+
+local function placeArm(rig, weld, target, attachPos, extra)
+	local sh = rig.shoulder
+	local pivot = sh.C0.Position
+	local handOff = rig.rel:PointToWorldSpace(attachPos)
+	local reach = (handOff - sh.C1.Position).Magnitude
+
+	local v = target - pivot
+	local dist = v.Magnitude
+	if dist < 0.05 then v = Vector3.new(0, 0, -1); dist = 1 end
+	local dir = v / dist
+	if dist > reach + MAX_STRETCH then
+		target = pivot + dir * (reach + MAX_STRETCH)
+	end
+
+	local R = CFrame.lookAt(Vector3.zero, dir) * CFrame.Angles(math.rad(90), 0, 0)
+	if extra then R = R * extra end
+	local AF = CFrame.new(target - R:VectorToWorldSpace(handOff)) * R
+	weld.C0 = AF * sh.C1
+	return AF
+end
+
+local function gunCFrame(P, base)
+	if not STRAIGHT_GUN then
+		return CFrame.new(P.gun) * base
+	end
+	local p = GRIP_POS * SCALE
+	local pivot = base * p
+	local t = P.tilt
+	local tilt = CFrame.Angles(math.rad(t.X), math.rad(t.Y), math.rad(t.Z))
+	return CFrame.new(P.gun) * CFrame.new(pivot) * tilt * STRAIGHT_ROT * CFrame.new(-p)
+end
+
+local function applyArms(c)
+	local P = c.P
+	local h = gunCFrame(P, c.base)
+
+	local AFr = placeArm(c.R, c.rW, h * (P.right * SCALE), c.rAttach.Position)
+	local grip = h:Inverse() * (AFr * c.R.rel * c.rAttach)
+	c.tool.Grip = grip
+	c.gripWeld.C1 = grip
+
+	local lt = P.leftTilt
+	local leftTilt = CFrame.Angles(math.rad(lt.X), math.rad(lt.Y), math.rad(lt.Z))
+	placeArm(c.L, c.lW, h * (P.left * SCALE), c.lAttach, leftTilt)
+end
+
+local function buildCtx(char, tool, P)
+	local gripWeld = char:FindFirstChild("RightGrip", true)
+	if not gripWeld then return nil, "no RightGrip" end
+
+	local R = getRig(char, "Right")
+	local L = getRig(char, "Left")
+	if not R then return nil, "no Right Shoulder motor" end
+	if not L then return nil, "no Left Shoulder motor" end
+
+	local refAF = rotatedAbout(R.shoulder.C0, armPose(REF_RIGHT)) * R.shoulder.C1:Inverse()
+	local base  = refAF * R.rel * gripWeld.C0 * refGrip():Inverse()
+
+	local lAttach = Vector3.new(0, -1, 0)
+	local att = char:FindFirstChild("LeftGripAttachment", true)
+	if att then lAttach = att.Position end
+
+	for _, m in ipairs(R.chain) do takeOver(m) end
+	for _, m in ipairs(L.chain) do takeOver(m) end
+	local rW = takeOver(R.shoulder)
+	local lW = takeOver(L.shoulder)
+	if not (rW and lW) then
+		release()
+		return nil, "takeOver failed (shoulder Part0/Part1 missing)"
+	end
+
+	return {
+		P = P, tool = tool, R = R, L = L, rW = rW, lW = lW,
+		base = base, gripWeld = gripWeld,
+		rAttach = gripWeld.C0, lAttach = lAttach,
+	}
+end
+
+local function buildCtxR15(char, tool, P)
+	local gripWeld = char:FindFirstChild("RightGrip", true)
+	if not gripWeld then return nil, "no RightGrip" end
+	local R = getRig(char, "Right")
+	local L = getRig(char, "Left")
+	if not R then return nil, "no RightShoulder motor" end
+	if not L then return nil, "no LeftShoulder motor" end
+
+	local refAF = rotatedAbout(R.shoulder.C0, armPose(REF_RIGHT)) * R.shoulder.C1:Inverse()
+	local base  = refAF * R.rel * gripWeld.C0 * refGrip():Inverse()
+
+	local lAttach = Vector3.new(0, -1, 0)
+	local att = char:FindFirstChild("LeftGripAttachment", true)
+	if att then lAttach = att.Position end
+
+	return {
+		P = P, tool = tool, R = R, L = L,
+		rW = {C0 = CFrame.new()}, lW = {C0 = CFrame.new()},
+		base = base, gripWeld = gripWeld,
+		rAttach = gripWeld.C0, lAttach = lAttach,
+	}
+end
+
+local function startR15Pose(char, tool, ctx)
+	local function apply()
+		applyArms(ctx)
+		ctx.R.shoulder.Transform = ctx.R.shoulder.C0:Inverse() * ctx.rW.C0
+		ctx.L.shoulder.Transform = ctx.L.shoulder.C0:Inverse() * ctx.lW.C0
+		for _, m in ipairs(ctx.R.chain) do m.Transform = CFrame.new() end
+		for _, m in ipairs(ctx.L.chain) do m.Transform = CFrame.new() end
+	end
+
+	local function step()
+		if tool.Parent ~= char then return end
+		local gw = char:FindFirstChild("RightGrip", true)
+		if gw then ctx.gripWeld = gw end
+		pcall(apply)
+	end
+
+	local conns = {
+		RunService.RenderStepped:Connect(function()
+			step()
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			local animator = hum and hum:FindFirstChildOfClass("Animator")
+			if animator then
+				for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+					if tr.Name:lower():find("tool") then tr:Stop(0) end
+				end
+			end
+		end),
+		RunService.Stepped:Connect(step),
+		RunService.Heartbeat:Connect(step),
+	}
+
+	return function()
+		for _, c in ipairs(conns) do c:Disconnect() end
+		pcall(function()
+			ctx.R.shoulder.Transform = CFrame.new()
+			ctx.L.shoulder.Transform = CFrame.new()
+		end)
+	end
+end
+
+local function hookTool(tool)
+	local resetWeapon = setupWeapon(tool)
+
+	tool.Equipped:Connect(function()
+		local char = tool.Parent
+		if not (char and char:IsA("Model")) then return end
+		release()
+
+		local P = PROFILES[rigOf(char)]
+		local isR15 = rigOf(char) == "R15"
+
+		task.spawn(function()
+			local ctx, why
+			stats.arm = "equipped, taking over..."; debugUpdate(true)
+			local t0 = os.clock()
+			while os.clock() - t0 < 8 do
+				if tool.Parent ~= char then return end
+				if isR15 then
+					ctx, why = buildCtxR15(char, tool, P)
+				else
+					ctx, why = buildCtx(char, tool, P)
+				end
+				if ctx then break end
+				task.wait(0.2)
+			end
+			if not ctx then
+				stats.arm = "FAILED: " .. tostring(why); debugUpdate(true)
+				return
+			end
+			stats.arm = "ok (" .. rigOf(char) .. ")"; debugUpdate(true)
+
+			if isR15 then
+				maintainClean = startR15Pose(char, tool, ctx)
+				return
+			end
+
+			applyArms(ctx)
+			local lastScan = 0
+			local conn = RunService.RenderStepped:Connect(function()
+				if tool.Parent ~= char then return end
+
+				local nowT = os.clock()
+				if nowT - lastScan > 0.15 then
+					lastScan = nowT
+					local armParts = {}
+					for _, a in ipairs(active) do
+						if a.part1 then armParts[a.part1] = true end
+					end
+					for _, d in ipairs(char:GetDescendants()) do
+						if d:IsA("Motor6D") and d.Part1 and armParts[d.Part1] then
+							table.insert(active, {motor = d, part1 = d.Part1})
+							d.Part1 = nil
+							stats.resets += 1
+						end
+					end
+				end
+
+				for _, a in ipairs(active) do
+					if a.motor and a.motor.Parent and a.motor.Part1 ~= nil then
+						a.motor.Part1 = nil
+						stats.resets += 1
+					end
+					if a.weld and a.motor and a.motor.Part0 and a.weld.Parent ~= a.motor.Part0 then
+						a.weld.Parent = a.motor.Part0
+					end
+				end
+
+				local gw = char:FindFirstChild("RightGrip", true)
+				if gw then ctx.gripWeld = gw end
+				pcall(applyArms, ctx)
+
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				local animator = hum and hum:FindFirstChildOfClass("Animator")
+				if animator then
+					for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+						if tr.Name:lower():find("tool") then tr:Stop(0) end
+					end
+				end
+			end)
+			maintainClean = function() conn:Disconnect() end
+		end)
+	end)
+
+	tool.Unequipped:Connect(function()
+		release()
+		resetWeapon()
+	end)
+end
+
+local function give()
+	local backpack = LocalPlayer:WaitForChild("Backpack")
+	local char = LocalPlayer.Character
+	if backpack:FindFirstChild(TOOL_NAME) or (char and char:FindFirstChild(TOOL_NAME)) then return end
+	local tool = buildTool()
+	hookTool(tool)
+	tool.Parent = backpack
+end
+
+give()
+LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(1)
+	give()
+end)
+
+task.spawn(function()
+	local StarterGui = game:GetService("StarterGui")
+
+	local function notify(title, text, icon, duration)
+		for _ = 1, 20 do
+			local ok = pcall(function()
+				StarterGui:SetCore("SendNotification", {
+					Title = title,
+					Text = text,
+					Icon = icon,
+					Duration = duration or 8,
+				})
+			end)
+			if ok then return end
+			task.wait(0.5)
+		end
+	end
+
+	local faceIcon
+	local okId, userId = pcall(function() return Players:GetUserIdFromNameAsync("DuaKNo") end)
+	if okId and userId then
+		faceIcon = ("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150"):format(userId)
+	end
+
+	notify("M134 for NPCs", "By DuaKNo", faceIcon, 8)
+	task.wait(1)
+	notify("Follow on Instagram", "me_duakno", nil, 8)
+	task.wait(1)
+	notify("Join Discord server for more", "discord.gg/empgqd5qpq", nil, 8)
+end)
